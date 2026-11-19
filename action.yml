@@ -1,0 +1,242 @@
+name: License check
+description: >
+  Lists the licenses of all third-party dependencies (Maven, pnpm, Flutter), writes a report to the
+  job summary, compares it with the previous run and opens a GitHub issue when something relevant changed.
+author: anotheria solutions
+branding:
+  icon: shield
+  color: blue
+
+inputs:
+  working-directory:
+    description: Project directory, relative to the repository root.
+    default: .
+  type:
+    description: "Project type: auto, maven, pnpm or flutter. auto picks it from pom.xml, pnpm-lock.yaml or pubspec.lock."
+    default: auto
+  setup-toolchain:
+    description: Install Java / Node+pnpm / Flutter. Set to false if an earlier step already did.
+    default: "true"
+  java-version:
+    default: "21"
+  java-distribution:
+    default: temurin
+  maven-settings:
+    description: Content of a Maven settings.xml, for private repositories. Pass it from a secret.
+    default: ""
+  maven-excluded-scopes:
+    default: test,provided
+  node-version:
+    default: "22"
+  pnpm-include-dev:
+    description: Also check devDependencies.
+    default: "false"
+  flutter-channel:
+    default: stable
+  flutter-version:
+    description: Exact Flutter version. Empty means latest on flutter-channel.
+    default: ""
+  title:
+    description: Report title. Defaults to the repository name.
+    default: ""
+  artifact-name:
+    description: Artifact the report is stored in; the next run reads its baseline from it.
+    default: license-report
+  retention-days:
+    default: "90"
+  notify:
+    description: Open or comment on a GitHub issue when relevant changes are found.
+    default: "true"
+  issue-title:
+    default: "License check: changes detected"
+  issue-labels:
+    description: Comma-separated labels for a new issue. Created if missing.
+    default: license-check
+  issue-assignees:
+    description: Comma-separated GitHub logins to assign a new issue to.
+    default: ""
+  fail-on-unknown:
+    description: Fail the step if any dependency has an unknown or non-open-source license.
+    default: "false"
+  github-token:
+    default: ${{ github.token }}
+
+outputs:
+  type:
+    value: ${{ steps.detect.outputs.type }}
+  changed:
+    description: "true if a license changed or a new copyleft/unknown dependency appeared since the last run."
+    value: ${{ steps.report.outputs.changed }}
+  unknown-count:
+    value: ${{ steps.report.outputs.unknown-count }}
+  copyleft-count:
+    value: ${{ steps.report.outputs.copyleft-count }}
+  report:
+    description: Path of the Markdown report.
+    value: ${{ runner.temp }}/license-check/out/report.md
+
+runs:
+  using: composite
+  steps:
+    - id: detect
+      shell: bash
+      working-directory: ${{ inputs.working-directory }}
+      env:
+        TYPE: ${{ inputs.type }}
+      run: |
+        if [ "$TYPE" = auto ]; then
+          if [ -f pom.xml ]; then TYPE=maven
+          elif [ -f pnpm-lock.yaml ]; then TYPE=pnpm
+          elif [ -f pubspec.lock ] || [ -f pubspec.yaml ]; then TYPE=flutter
+          else echo "::error title=License check::No pom.xml, pnpm-lock.yaml or pubspec.lock found in '${{ inputs.working-directory }}'"; exit 1
+          fi
+        fi
+        echo "type=$TYPE" >> "$GITHUB_OUTPUT"
+        mkdir -p "$RUNNER_TEMP/license-check"
+        echo "Detected project type: $TYPE"
+
+    # --- toolchains -----------------------------------------------------------
+    - if: steps.detect.outputs.type == 'maven' && inputs.setup-toolchain == 'true'
+      uses: actions/setup-java@v6
+      with:
+        distribution: ${{ inputs.java-distribution }}
+        java-version: ${{ inputs.java-version }}
+        cache: maven
+        cache-dependency-path: ${{ inputs.working-directory }}/pom.xml
+
+    - if: steps.detect.outputs.type == 'pnpm' && inputs.setup-toolchain == 'true'
+      uses: pnpm/action-setup@v4
+      with:
+        package_json_file: ${{ inputs.working-directory }}/package.json
+
+    - if: steps.detect.outputs.type == 'pnpm' && inputs.setup-toolchain == 'true'
+      uses: actions/setup-node@v6
+      with:
+        node-version: ${{ inputs.node-version }}
+        cache: pnpm
+        cache-dependency-path: ${{ inputs.working-directory }}/pnpm-lock.yaml
+
+    - if: steps.detect.outputs.type == 'flutter' && inputs.setup-toolchain == 'true'
+      uses: subosito/flutter-action@v2
+      with:
+        channel: ${{ inputs.flutter-channel }}
+        flutter-version: ${{ inputs.flutter-version }}
+        cache: true
+
+    # --- collect --------------------------------------------------------------
+    - if: steps.detect.outputs.type == 'maven'
+      shell: bash
+      working-directory: ${{ inputs.working-directory }}
+      env:
+        MAVEN_SETTINGS: ${{ inputs.maven-settings }}
+        EXCLUDED_SCOPES: ${{ inputs.maven-excluded-scopes }}
+      run: |
+        settings=()
+        if [ -n "$MAVEN_SETTINGS" ]; then
+          printf '%s' "$MAVEN_SETTINGS" > "$RUNNER_TEMP/license-check/settings.xml"
+          settings=(-s "$RUNNER_TEMP/license-check/settings.xml")
+        fi
+        mvn "${settings[@]}" -B -ntp org.codehaus.mojo:license-maven-plugin:2.4.0:add-third-party \
+          -Dlicense.outputDirectory="$RUNNER_TEMP/license-check" \
+          -Dlicense.thirdPartyFilename=raw.tsv \
+          -Dlicense.fileTemplate="${{ github.action_path }}/templates/maven-licenses.ftl" \
+          -Dlicense.excludedScopes="$EXCLUDED_SCOPES"
+        echo "INPUT=$RUNNER_TEMP/license-check/raw.tsv" >> "$GITHUB_ENV"
+
+    - if: steps.detect.outputs.type == 'pnpm'
+      shell: bash
+      working-directory: ${{ inputs.working-directory }}
+      env:
+        INCLUDE_DEV: ${{ inputs.pnpm-include-dev }}
+      run: |
+        pnpm install --frozen-lockfile --ignore-scripts
+        prod=--prod
+        [ "$INCLUDE_DEV" = true ] && prod=
+        pnpm licenses list $prod --json > "$RUNNER_TEMP/license-check/raw.json"
+        echo "INPUT=$RUNNER_TEMP/license-check/raw.json" >> "$GITHUB_ENV"
+
+    - if: steps.detect.outputs.type == 'flutter'
+      shell: bash
+      working-directory: ${{ inputs.working-directory }}
+      run: |
+        flutter pub get --enforce-lockfile
+        echo "INPUT=$PWD" >> "$GITHUB_ENV"
+
+    # --- baseline from the last successful run ---------------------------------
+    - shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.github-token }}
+        ARTIFACT: ${{ inputs.artifact-name }}
+      run: |
+        dir="$RUNNER_TEMP/license-check/baseline"
+        mkdir -p "$dir"
+        # GITHUB_WORKFLOW_REF = owner/repo/.github/workflows/file.yml@ref
+        workflow="$(basename "${GITHUB_WORKFLOW_REF%@*}")"
+        ids="$(gh run list -R "$GITHUB_REPOSITORY" --workflow "$workflow" --branch "$GITHUB_REF_NAME" \
+          --status success --limit 10 --json databaseId -q '.[].databaseId' 2>/dev/null || true)"
+        for id in $ids; do
+          if gh run download "$id" -R "$GITHUB_REPOSITORY" -n "$ARTIFACT" -D "$dir" 2>/dev/null && [ -f "$dir/licenses.tsv" ]; then
+            echo "Baseline: run $id"
+            echo "BASELINE=$dir/licenses.tsv" >> "$GITHUB_ENV"
+            exit 0
+          fi
+        done
+        echo "No previous report found; this run becomes the baseline."
+
+    # --- report ---------------------------------------------------------------
+    - id: report
+      shell: bash
+      env:
+        TYPE: ${{ steps.detect.outputs.type }}
+        TITLE: ${{ inputs.title }}
+      run: |
+        out="$RUNNER_TEMP/license-check/out"
+        python3 "${{ github.action_path }}/scripts/license_report.py" \
+          --type "$TYPE" --input "$INPUT" --out-dir "$out" \
+          ${BASELINE:+--baseline "$BASELINE"} \
+          --title "${TITLE:-${GITHUB_REPOSITORY#*/}} – licenses"
+        cat "$out/report.md" >> "$GITHUB_STEP_SUMMARY"
+        if [ -f "$out/changes.md" ]; then
+          echo "::warning title=License check::License changes detected, see the job summary."
+        fi
+
+    - uses: actions/upload-artifact@v4
+      with:
+        name: ${{ inputs.artifact-name }}
+        path: |
+          ${{ runner.temp }}/license-check/out/licenses.tsv
+          ${{ runner.temp }}/license-check/out/report.md
+        retention-days: ${{ inputs.retention-days }}
+        overwrite: true
+
+    # --- notify ---------------------------------------------------------------
+    - if: steps.report.outputs.changed == 'true' && inputs.notify == 'true'
+      shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.github-token }}
+        ISSUE_TITLE: ${{ inputs.issue-title }}
+        LABELS: ${{ inputs.issue-labels }}
+        ASSIGNEES: ${{ inputs.issue-assignees }}
+      run: |
+        body="$RUNNER_TEMP/license-check/out/changes.md"
+        number="$(gh issue list -R "$GITHUB_REPOSITORY" --state open --search "in:title \"$ISSUE_TITLE\"" \
+          --json number,title -q "map(select(.title == env.ISSUE_TITLE)) | .[0].number // empty")"
+        if [ -n "$number" ]; then
+          gh issue comment "$number" -R "$GITHUB_REPOSITORY" --body-file "$body"
+        else
+          args=()
+          IFS=',' read -ra labels <<< "$LABELS"
+          for l in "${labels[@]}"; do
+            l="$(echo "$l" | xargs)"; [ -z "$l" ] && continue
+            gh label create "$l" -R "$GITHUB_REPOSITORY" --color D93F0B --force >/dev/null 2>&1 || true
+            args+=(--label "$l")
+          done
+          [ -n "$ASSIGNEES" ] && args+=(--assignee "$ASSIGNEES")
+          gh issue create -R "$GITHUB_REPOSITORY" --title "$ISSUE_TITLE" --body-file "$body" "${args[@]}"
+        fi
+
+    - if: inputs.fail-on-unknown == 'true' && steps.report.outputs.unknown-count != '0'
+      shell: bash
+      run: |
+        echo "::error title=License check::${{ steps.report.outputs.unknown-count }} dependencies with unknown or non-open-source licenses."
+        exit 1

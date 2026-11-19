@@ -1,0 +1,36 @@
+name: test
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: read
+  issues: write
+
+jobs:
+  fixture:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        project: [maven, pnpm, flutter]
+    steps:
+      - uses: actions/checkout@v6
+      - id: check
+        uses: ./
+        with:
+          working-directory: test/${{ matrix.project }}
+          artifact-name: license-report-${{ matrix.project }}
+          title: fixture ${{ matrix.project }}
+          notify: "false"
+      - name: Verify
+        env:
+          TYPE: ${{ steps.check.outputs.type }}
+          REPORT: ${{ steps.check.outputs.report }}
+        run: |
+          test "$TYPE" = "${{ matrix.project }}"
+          test -s "$REPORT"
+          head -5 "$REPORT"
