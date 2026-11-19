@@ -105,7 +105,7 @@ runs:
         cache-dependency-path: ${{ inputs.working-directory }}/pom.xml
 
     - if: steps.detect.outputs.type == 'pnpm' && inputs.setup-toolchain == 'true'
-      uses: pnpm/action-setup@v4
+      uses: pnpm/action-setup@v6
       with:
         package_json_file: ${{ inputs.working-directory }}/package.json
 
@@ -159,7 +159,12 @@ runs:
       shell: bash
       working-directory: ${{ inputs.working-directory }}
       run: |
-        flutter pub get --enforce-lockfile
+        # The lockfile pins SDK packages to the Flutter version that wrote it; if the runner's
+        # Flutter differs, fall back to a normal resolve so the check still runs.
+        if ! flutter pub get --enforce-lockfile; then
+          echo "::warning title=License check::pubspec.lock doesn't match this Flutter SDK; resolved dependencies afresh. Set flutter-version to match the project."
+          flutter pub get
+        fi
         echo "INPUT=$PWD" >> "$GITHUB_ENV"
 
     # --- baseline from the last successful run ---------------------------------
@@ -200,7 +205,7 @@ runs:
           echo "::warning title=License check::License changes detected, see the job summary."
         fi
 
-    - uses: actions/upload-artifact@v4
+    - uses: actions/upload-artifact@v7
       with:
         name: ${{ inputs.artifact-name }}
         path: |
