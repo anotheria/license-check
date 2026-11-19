@@ -16,7 +16,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        project: [maven, pnpm, flutter]
+        project: [maven, pnpm, npm, flutter, pip]
     steps:
       - uses: actions/checkout@v6
       - id: check
@@ -34,3 +34,28 @@ jobs:
           test "$TYPE" = "${{ matrix.project }}"
           test -s "$REPORT"
           head -5 "$REPORT"
+
+  # Two checks in one job must not share state.
+  multi:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - id: npm
+        uses: ./
+        with:
+          working-directory: test/npm
+          artifact-name: license-report-multi-npm
+          notify: "false"
+      - id: pip
+        uses: ./
+        with:
+          working-directory: test/pip
+          artifact-name: license-report-multi-pip
+          notify: "false"
+      - name: Verify
+        run: |
+          test "${{ steps.npm.outputs.type }}" = npm
+          test "${{ steps.pip.outputs.type }}" = pip
+          grep -q is-number "${{ steps.npm.outputs.report }}"
+          ! grep -q is-number "${{ steps.pip.outputs.report }}"
+          grep -q requests "${{ steps.pip.outputs.report }}"

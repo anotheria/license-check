@@ -5,7 +5,9 @@ Stdlib only, so it runs on any GitHub-hosted runner without extra installs.
 
   license_report.py --type maven   --input licenses.tsv     --out-dir out [--baseline old/licenses.tsv]
   license_report.py --type pnpm    --input licenses.json    --out-dir out [--baseline ...]
+  license_report.py --type npm     --input package-lock.json --out-dir out [--baseline ...] [--include-dev]
   license_report.py --type flutter --input <project dir>    --out-dir out [--baseline ...]
+  license_report.py --type pip     --input pip.json         --out-dir out [--baseline ...]
 
 Writes out/licenses.tsv (name, version, license, category), out/report.md and,
 if something relevant changed, out/changes.md. Prints `changed`, `unknown-count`
@@ -34,7 +36,7 @@ PATTERNS = [
     (STRONG_COPYLEFT, r"\bgpl|general public license"),
     (WEAK_COPYLEFT, r"\bmpl\b|mpl-|mozilla|\bepl\b|epl-|eclipse public|\bcddl|common development and distribution"),
     (PERMISSIVE, r"apache|\bmit\b|mit-|\bx11\b|\bbsd|0bsd|\bisc\b|\bedl\b|eclipse distribution|cc0|public domain|unlicense"
-                 r"|blueoak|python-2|psf|zlib|bouncy castle|go license|wtfpl|cc-by-|similar to apache|\bw3c|json license"
+                 r"|blueoak|python-2|psf|python software foundation|hpnd|historical permission|zlib|bouncy castle|go license|wtfpl|cc-by-|similar to apache|\bw3c|json license"
                  r"|boost|bsl-1|artistic|ofl|unicode"),
 ]
 
@@ -85,6 +87,35 @@ def collect_pnpm(path):
         for p in packages:
             rows.append((p["name"], ",".join(p.get("versions", [])), p.get("license") or key or "Unknown"))
     return rows
+
+
+def npm_license(pkg):
+    lic = pkg.get("license")
+    if isinstance(lic, dict):
+        lic = lic.get("type")
+    if not lic and isinstance(pkg.get("licenses"), list):
+        lic = " OR ".join(str(l.get("type") if isinstance(l, dict) else l) for l in pkg["licenses"])
+    return str(lic) if lic else "Unknown"
+
+
+def collect_npm(path, include_dev=False):
+    """package-lock.json (lockfileVersion 2/3), which records each package's license; no install needed."""
+    packages = json.loads(Path(path).read_text()).get("packages", {})
+    rows = {}
+    for key, pkg in packages.items():
+        if not key or pkg.get("link"):
+            continue
+        if not include_dev and (pkg.get("dev") or pkg.get("devOptional")):
+            continue
+        name = pkg.get("name") or key.rsplit("node_modules/", 1)[-1]
+        entry = rows.setdefault(name, [set(), npm_license(pkg)])
+        entry[0].add(pkg.get("version", ""))
+    return [(name, ",".join(sorted(v)), lic) for name, (v, lic) in rows.items()]
+
+
+def collect_pip(path):
+    """Output of scripts/pip_licenses.py."""
+    return [(r["name"], r["version"], r["license"]) for r in json.loads(Path(path).read_text())]
 
 
 def sniff_license_text(text):
@@ -145,7 +176,7 @@ def collect_flutter(project_dir):
     return rows
 
 
-COLLECTORS = {"maven": collect_maven, "pnpm": collect_pnpm, "flutter": collect_flutter}
+COLLECTORS = {"maven": collect_maven, "pnpm": collect_pnpm, "npm": collect_npm, "flutter": collect_flutter, "pip": collect_pip}
 
 
 # --- report -----------------------------------------------------------------
@@ -182,13 +213,16 @@ def main():
     ap.add_argument("--out-dir", required=True)
     ap.add_argument("--baseline")
     ap.add_argument("--title", default="License report")
+    ap.add_argument("--include-dev", action="store_true", help="npm: also list devDependencies")
     args = ap.parse_args()
 
     out = Path(args.out_dir)
     out.mkdir(parents=True, exist_ok=True)
 
     current = {}
-    for name, version, lic in COLLECTORS[args.type](args.input):
+    collector = COLLECTORS[args.type]
+    rows = collector(args.input, args.include_dev) if args.type == "npm" else collector(args.input)
+    for name, version, lic in rows:
         lic = " ".join(lic.split())
         current[name] = {"version": version, "license": lic, "category": classify(lic)}
 

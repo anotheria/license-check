@@ -9,11 +9,13 @@ Supported project types (auto-detected):
 |---------|------------------|----------------------------|
 | Maven   | `pom.xml`        | `license-maven-plugin` (declared POM licenses), test/provided scope excluded |
 | pnpm    | `pnpm-lock.yaml` | `pnpm licenses list --prod` (`package.json` license field) |
+| npm     | `package-lock.json` | License recorded in the lockfile (v2/v3), dev dependencies excluded; nothing is installed |
 | Flutter | `pubspec.lock`   | Each package's `LICENSE` file, classified by its text |
+| pip     | `requirements.txt` | Installs into a virtualenv and reads each package's metadata (License-Expression, classifiers, License) |
 
 ## What it does
 
-1. Sets up Java / Node + pnpm / Flutter (can be turned off).
+1. Sets up Java / Node + pnpm / Flutter / Python (can be turned off).
 2. Collects every dependency with its version and license and classifies the license as
    `permissive`, `weak-copyleft`, `strong-copyleft` or `unknown` (unrecognised or not open source).
    For dual-licensed packages the most permissive option counts.
@@ -57,21 +59,40 @@ jobs:
 
 Scheduled workflows only run on the repository's default branch.
 
+### Several projects in one repository
+
+Call the action once per project with its own `working-directory` and a unique `artifact-name`:
+
+```yaml
+      - uses: anotheria/license-check@v1
+        with:
+          working-directory: backend
+          artifact-name: license-report-backend
+          title: my-repo backend
+      - uses: anotheria/license-check@v1
+        with:
+          working-directory: frontend
+          artifact-name: license-report-frontend
+          title: my-repo frontend
+```
+
 ## Inputs
 
 | Input | Default | Description |
 |---|---|---|
 | `working-directory` | `.` | Project directory |
-| `type` | `auto` | `auto`, `maven`, `pnpm` or `flutter` |
+| `type` | `auto` | `auto`, `maven`, `pnpm`, `npm`, `flutter` or `pip` |
 | `setup-toolchain` | `true` | Install the toolchain; set `false` if you already did |
 | `java-version` / `java-distribution` | `21` / `temurin` | |
 | `maven-settings` | | Content of a `settings.xml`, pass it from a secret |
 | `maven-excluded-scopes` | `test,provided` | |
 | `node-version` | `22` | |
-| `pnpm-include-dev` | `false` | Also check devDependencies |
+| `include-dev` | `false` | Also check devDependencies (pnpm, npm) |
 | `flutter-channel` / `flutter-version` | `stable` / latest | |
+| `python-version` | `3.12` | |
+| `requirements-file` | `requirements.txt` | Relative to `working-directory` |
 | `title` | repository name | Report title |
-| `artifact-name` | `license-report` | |
+| `artifact-name` | `license-report` | Must be unique per check within a workflow |
 | `retention-days` | `90` | |
 | `notify` | `true` | Open/comment on an issue on relevant changes |
 | `issue-title` | `License check: changes detected` | |

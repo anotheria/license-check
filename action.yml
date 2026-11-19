@@ -1,6 +1,6 @@
 name: License check
 description: >
-  Lists the licenses of all third-party dependencies (Maven, pnpm, Flutter), writes a report to the
+  Lists the licenses of all third-party dependencies (Maven, pnpm, npm, Flutter, pip), writes a report to the
   job summary, compares it with the previous run and opens a GitHub issue when something relevant changed.
 author: anotheria solutions
 branding:
@@ -12,10 +12,12 @@ inputs:
     description: Project directory, relative to the repository root.
     default: .
   type:
-    description: "Project type: auto, maven, pnpm or flutter. auto picks it from pom.xml, pnpm-lock.yaml or pubspec.lock."
+    description: >
+      Project type: auto, maven, pnpm, npm, flutter or pip. auto picks it from pom.xml, pnpm-lock.yaml,
+      package-lock.json, pubspec.lock or requirements.txt.
     default: auto
   setup-toolchain:
-    description: Install Java / Node+pnpm / Flutter. Set to false if an earlier step already did.
+    description: Install Java / Node+pnpm / Flutter / Python (npm needs nothing). Set to false if an earlier step already did.
     default: "true"
   java-version:
     default: "21"
@@ -28,19 +30,29 @@ inputs:
     default: test,provided
   node-version:
     default: "22"
+  include-dev:
+    description: Also check devDependencies (pnpm, npm).
+    default: "false"
   pnpm-include-dev:
-    description: Also check devDependencies.
+    description: Deprecated alias of include-dev.
     default: "false"
   flutter-channel:
     default: stable
   flutter-version:
     description: Exact Flutter version. Empty means latest on flutter-channel.
     default: ""
+  python-version:
+    default: "3.12"
+  requirements-file:
+    description: pip requirements file, relative to working-directory.
+    default: requirements.txt
   title:
     description: Report title. Defaults to the repository name.
     default: ""
   artifact-name:
-    description: Artifact the report is stored in; the next run reads its baseline from it.
+    description: >
+      Artifact the report is stored in; the next run reads its baseline from it. Must be unique per
+      check when the action runs more than once in a workflow.
     default: license-report
   retention-days:
     default: "90"
@@ -73,7 +85,7 @@ outputs:
     value: ${{ steps.report.outputs.copyleft-count }}
   report:
     description: Path of the Markdown report.
-    value: ${{ runner.temp }}/license-check/out/report.md
+    value: ${{ steps.detect.outputs.dir }}/out/report.md
 
 runs:
   using: composite
@@ -83,16 +95,23 @@ runs:
       working-directory: ${{ inputs.working-directory }}
       env:
         TYPE: ${{ inputs.type }}
+        REQUIREMENTS: ${{ inputs.requirements-file }}
+        ARTIFACT: ${{ inputs.artifact-name }}
       run: |
         if [ "$TYPE" = auto ]; then
           if [ -f pom.xml ]; then TYPE=maven
           elif [ -f pnpm-lock.yaml ]; then TYPE=pnpm
+          elif [ -f package-lock.json ]; then TYPE=npm
           elif [ -f pubspec.lock ] || [ -f pubspec.yaml ]; then TYPE=flutter
-          else echo "::error title=License check::No pom.xml, pnpm-lock.yaml or pubspec.lock found in '${{ inputs.working-directory }}'"; exit 1
+          elif [ -f "$REQUIREMENTS" ]; then TYPE=pip
+          else echo "::error title=License check::No pom.xml, pnpm-lock.yaml, package-lock.json, pubspec.lock or $REQUIREMENTS found in '${{ inputs.working-directory }}'"; exit 1
           fi
         fi
+        # Separate scratch dir per invocation, so several checks can run in one job.
+        dir="$RUNNER_TEMP/license-check/$ARTIFACT"
+        rm -rf "$dir" && mkdir -p "$dir"
         echo "type=$TYPE" >> "$GITHUB_OUTPUT"
-        mkdir -p "$RUNNER_TEMP/license-check"
+        echo "dir=$dir" >> "$GITHUB_OUTPUT"
         echo "Detected project type: $TYPE"
 
     # --- toolchains -----------------------------------------------------------
@@ -123,57 +142,76 @@ runs:
         flutter-version: ${{ inputs.flutter-version }}
         cache: true
 
+    - if: steps.detect.outputs.type == 'pip' && inputs.setup-toolchain == 'true'
+      uses: actions/setup-python@v6
+      with:
+        python-version: ${{ inputs.python-version }}
+
     # --- collect --------------------------------------------------------------
-    - if: steps.detect.outputs.type == 'maven'
+    - id: collect
       shell: bash
       working-directory: ${{ inputs.working-directory }}
       env:
+        TYPE: ${{ steps.detect.outputs.type }}
+        DIR: ${{ steps.detect.outputs.dir }}
         MAVEN_SETTINGS: ${{ inputs.maven-settings }}
         EXCLUDED_SCOPES: ${{ inputs.maven-excluded-scopes }}
+        INCLUDE_DEV: ${{ inputs.include-dev == 'true' || inputs.pnpm-include-dev == 'true' }}
+        REQUIREMENTS: ${{ inputs.requirements-file }}
+        ACTION_PATH: ${{ github.action_path }}
       run: |
-        settings=()
-        if [ -n "$MAVEN_SETTINGS" ]; then
-          printf '%s' "$MAVEN_SETTINGS" > "$RUNNER_TEMP/license-check/settings.xml"
-          settings=(-s "$RUNNER_TEMP/license-check/settings.xml")
-        fi
-        mvn "${settings[@]}" -B -ntp org.codehaus.mojo:license-maven-plugin:2.4.0:add-third-party \
-          -Dlicense.outputDirectory="$RUNNER_TEMP/license-check" \
-          -Dlicense.thirdPartyFilename=raw.tsv \
-          -Dlicense.fileTemplate="${{ github.action_path }}/templates/maven-licenses.ftl" \
-          -Dlicense.excludedScopes="$EXCLUDED_SCOPES"
-        echo "INPUT=$RUNNER_TEMP/license-check/raw.tsv" >> "$GITHUB_ENV"
-
-    - if: steps.detect.outputs.type == 'pnpm'
-      shell: bash
-      working-directory: ${{ inputs.working-directory }}
-      env:
-        INCLUDE_DEV: ${{ inputs.pnpm-include-dev }}
-      run: |
-        pnpm install --frozen-lockfile --ignore-scripts
-        prod=--prod
-        [ "$INCLUDE_DEV" = true ] && prod=
-        pnpm licenses list $prod --json > "$RUNNER_TEMP/license-check/raw.json"
-        echo "INPUT=$RUNNER_TEMP/license-check/raw.json" >> "$GITHUB_ENV"
-
-    - if: steps.detect.outputs.type == 'flutter'
-      shell: bash
-      working-directory: ${{ inputs.working-directory }}
-      run: |
-        # The lockfile pins SDK packages to the Flutter version that wrote it; if the runner's
-        # Flutter differs, fall back to a normal resolve so the check still runs.
-        if ! flutter pub get --enforce-lockfile; then
-          echo "::warning title=License check::pubspec.lock doesn't match this Flutter SDK; resolved dependencies afresh. Set flutter-version to match the project."
-          flutter pub get
-        fi
-        echo "INPUT=$PWD" >> "$GITHUB_ENV"
+        case "$TYPE" in
+          maven)
+            settings=()
+            if [ -n "$MAVEN_SETTINGS" ]; then
+              printf '%s' "$MAVEN_SETTINGS" > "$DIR/settings.xml"
+              settings=(-s "$DIR/settings.xml")
+            fi
+            mvn "${settings[@]}" -B -ntp org.codehaus.mojo:license-maven-plugin:2.4.0:add-third-party \
+              -Dlicense.outputDirectory="$DIR" \
+              -Dlicense.thirdPartyFilename=raw.tsv \
+              -Dlicense.fileTemplate="$ACTION_PATH/templates/maven-licenses.ftl" \
+              -Dlicense.excludedScopes="$EXCLUDED_SCOPES"
+            input="$DIR/raw.tsv"
+            ;;
+          pnpm)
+            pnpm install --frozen-lockfile --ignore-scripts
+            prod=--prod; [ "$INCLUDE_DEV" = true ] && prod=
+            pnpm licenses list $prod --json > "$DIR/raw.json"
+            input="$DIR/raw.json"
+            ;;
+          npm)
+            # package-lock.json already records every package's license, so nothing is installed.
+            input="$PWD/package-lock.json"
+            ;;
+          flutter)
+            # The lockfile pins SDK packages to the Flutter version that wrote it; if the runner's
+            # Flutter differs, fall back to a normal resolve so the check still runs.
+            if ! flutter pub get --enforce-lockfile; then
+              echo "::warning title=License check::pubspec.lock doesn't match this Flutter SDK; resolved dependencies afresh. Set flutter-version to match the project."
+              flutter pub get
+            fi
+            input="$PWD"
+            ;;
+          pip)
+            python3 -m venv "$DIR/venv"
+            "$DIR/venv/bin/pip" install -q --disable-pip-version-check -r "$REQUIREMENTS"
+            "$DIR/venv/bin/python" "$ACTION_PATH/scripts/pip_licenses.py" > "$DIR/raw.json"
+            input="$DIR/raw.json"
+            ;;
+          *) echo "::error title=License check::Unsupported type '$TYPE'"; exit 1 ;;
+        esac
+        echo "input=$input" >> "$GITHUB_OUTPUT"
 
     # --- baseline from the last successful run ---------------------------------
-    - shell: bash
+    - id: baseline
+      shell: bash
       env:
         GH_TOKEN: ${{ inputs.github-token }}
         ARTIFACT: ${{ inputs.artifact-name }}
+        DIR: ${{ steps.detect.outputs.dir }}
       run: |
-        dir="$RUNNER_TEMP/license-check/baseline"
+        dir="$DIR/baseline"
         mkdir -p "$dir"
         # GITHUB_WORKFLOW_REF = owner/repo/.github/workflows/file.yml@ref
         workflow="$(basename "${GITHUB_WORKFLOW_REF%@*}")"
@@ -182,7 +220,7 @@ runs:
         for id in $ids; do
           if gh run download "$id" -R "$GITHUB_REPOSITORY" -n "$ARTIFACT" -D "$dir" 2>/dev/null && [ -f "$dir/licenses.tsv" ]; then
             echo "Baseline: run $id"
-            echo "BASELINE=$dir/licenses.tsv" >> "$GITHUB_ENV"
+            echo "file=$dir/licenses.tsv" >> "$GITHUB_OUTPUT"
             exit 0
           fi
         done
@@ -193,11 +231,17 @@ runs:
       shell: bash
       env:
         TYPE: ${{ steps.detect.outputs.type }}
+        DIR: ${{ steps.detect.outputs.dir }}
+        INPUT: ${{ steps.collect.outputs.input }}
+        BASELINE: ${{ steps.baseline.outputs.file }}
+        INCLUDE_DEV: ${{ inputs.include-dev == 'true' || inputs.pnpm-include-dev == 'true' }}
         TITLE: ${{ inputs.title }}
+        ACTION_PATH: ${{ github.action_path }}
       run: |
-        out="$RUNNER_TEMP/license-check/out"
-        python3 "${{ github.action_path }}/scripts/license_report.py" \
-          --type "$TYPE" --input "$INPUT" --out-dir "$out" \
+        out="$DIR/out"
+        dev=(); [ "$INCLUDE_DEV" = true ] && dev=(--include-dev)
+        python3 "$ACTION_PATH/scripts/license_report.py" \
+          --type "$TYPE" --input "$INPUT" --out-dir "$out" "${dev[@]}" \
           ${BASELINE:+--baseline "$BASELINE"} \
           --title "${TITLE:-${GITHUB_REPOSITORY#*/}} – licenses"
         cat "$out/report.md" >> "$GITHUB_STEP_SUMMARY"
@@ -209,8 +253,8 @@ runs:
       with:
         name: ${{ inputs.artifact-name }}
         path: |
-          ${{ runner.temp }}/license-check/out/licenses.tsv
-          ${{ runner.temp }}/license-check/out/report.md
+          ${{ steps.detect.outputs.dir }}/out/licenses.tsv
+          ${{ steps.detect.outputs.dir }}/out/report.md
         retention-days: ${{ inputs.retention-days }}
         overwrite: true
 
@@ -222,8 +266,9 @@ runs:
         ISSUE_TITLE: ${{ inputs.issue-title }}
         LABELS: ${{ inputs.issue-labels }}
         ASSIGNEES: ${{ inputs.issue-assignees }}
+        DIR: ${{ steps.detect.outputs.dir }}
       run: |
-        body="$RUNNER_TEMP/license-check/out/changes.md"
+        body="$DIR/out/changes.md"
         number="$(gh issue list -R "$GITHUB_REPOSITORY" --state open --search "in:title \"$ISSUE_TITLE\"" \
           --json number,title -q "map(select(.title == env.ISSUE_TITLE)) | .[0].number // empty")"
         if [ -n "$number" ]; then
